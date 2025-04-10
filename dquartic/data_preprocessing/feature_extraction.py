@@ -14,9 +14,25 @@ Features:
     - Visualizes identification metrics using matplotlib.
     - Configurable via a JSON file (default: dquartic_train_config.json).
 
+Output Files:
+    - MS1 Features File: output_features/ms1_features/ms1_features_all_peptides_combined.csv
+      Columns: Peptide, Charge, Run, RetentionTime, Precursor_mz, Intensity
+  
+    - MS2 Features File: output_features/ms2_features/ms2_features_all_peptides_combined.csv
+      Columns: Peptide, Charge, Run, RetentionTime, Fragment_mz, Precursor_mz, Intensity
+
+File Sizes:
+    - Small datasets (~1,000 peptides): 5-50 MB per file
+    - Medium datasets (~10,000 peptides): 50-500 MB per file
+    - Large datasets (>50,000 peptides): 0.5-5 GB per file
+    - MS2 files are typically 5-10× larger than MS1 files
+
 Usage:
     python Feature_extraction.py --config dquartic_train_config.json
 """
+
+
+
 
 import os
 import json
@@ -26,10 +42,24 @@ import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import cudf  # Ensure you have cuDF installed as part of RAPIDS
+import joblib
+Parallel = joblib.Parallel
+delayed = joblib.delayed
+
+
+# Check for cuDF pandas accelerator availability
+try:
+    import cudf.pandas
+    cudf.pandas.initialize()  # Enable pandas accelerator mode
+    GPU_AVAILABLE = True
+    logging.info("GPU acceleration enabled with cuDF pandas accelerator")
+except ImportError:
+    GPU_AVAILABLE = False
+    logging.warning("cuDF not available. Using standard pandas (CPU-only)")
+
+
 from tqdm import tqdm
 
-# These imports should be adjusted based on your project structure
 from massdash.loaders import MzMLDataLoader
 from massdash.structs import TargetedDIAConfig
 
@@ -88,15 +118,13 @@ class DIAtoMassProcessor:
         and renames columns in the spectral library file to match MassDASH expected names.
         Also generates a plot of identifications per file.
         
-        Returns:
-            tuple: (report_tsv_path, gen_lib_modified_tsv_path)
         """
-        logging.info("Converting report.parquet to report.tsv...")
+        logging.info("Converting {self.report_path} to report.tsv...")
         report_df = pd.read_parquet(self.report_path)
         report_tsv_path = os.path.join(os.path.dirname(self.output_dir), 'report.tsv')
         report_df.to_csv(report_tsv_path, sep='\t', index=False)
         
-        logging.info("Converting gen_spec_lib.parquet to gen_lib_modified.tsv...")
+        logging.info("Converting {self.gen_lib_path} to gen_lib_modified.tsv...")
         gen_lib_df = pd.read_parquet(self.gen_lib_path)
         
         # Mapping of DIA-NN column names to MassDASH column names.
@@ -122,7 +150,7 @@ class DIAtoMassProcessor:
         self.plot_identifications(report_df)
         
         logging.info(f"Conversion complete. Files saved to {report_tsv_path} and {gen_lib_modified_tsv_path}")
-        return report_tsv_path, gen_lib_modified_tsv_path
+        
 
     def plot_identifications(self, report_df):
         """
@@ -130,9 +158,6 @@ class DIAtoMassProcessor:
 
         Args:
             report_df (pandas.DataFrame): DataFrame containing the DIA-NN report.
-        
-        Returns:
-            str: Path to the saved plot image.
         """
         logging.info("Plotting identifications per file at 1% FDR...")
         filtered_df = report_df[report_df["Q.Value"] < 0.01]
@@ -150,7 +175,7 @@ class DIAtoMassProcessor:
         plot_path = os.path.join(self.output_dir, "identifications_per_file.png")
         plt.savefig(plot_path)
         logging.info(f"Plot saved to {plot_path}")
-        return plot_path
+        
 
     def initialize_loader(self):
         """
@@ -181,13 +206,70 @@ class DIAtoMassProcessor:
         self.extraction_config.mz_tol = self.mz_tol
         logging.info(f"Extraction configured with RT window: {self.rt_window}s, m/z tolerance: {self.mz_tol} ppm")
 
+    def process_run(self, run_name, feature_map, peptide, charge):
+        """
+        Process a single run for a peptide/charge pair.
+        
+        Args:
+            run_name (str): Name of the run.
+            feature_map: Feature map from MassDASH loader.
+            peptide (str): Peptide sequence.
+            charge (int): Precursor charge.
+            
+        Returns:
+            tuple: (ms1_dataframe, ms2_dataframe) containing extracted features.
+        """
+        # Copy feature DataFrame and add identifying columns
+        df = feature_map.feature_df.copy()
+        df['Peptide'] = peptide
+        df['Charge'] = charge
+        df['Run'] = run_name
+        
+        # Use GPU acceleration if available
+        if GPU_AVAILABLE:
+            # Convert to cuDF DataFrame for GPU processing
+            gpu_df = cudf.DataFrame.from_pandas(df)
+            
+            # Extract MS1 (Precursor) Data
+            ms1_gpu = gpu_df[(gpu_df['ms_level'] == 1) & (gpu_df['Annotation'] == 'prec')]
+            ms1_gpu = ms1_gpu[['Peptide', 'Charge', 'Run', 'rt', 'precursor_mz', 'int']]
+            ms1_gpu = ms1_gpu.rename(columns={'rt': 'RetentionTime',
+                                            'precursor_mz': 'Precursor_mz',
+                                            'int': 'Intensity'})
+            ms1_df = ms1_gpu.to_pandas()
+            
+            # Extract MS2 (Fragment) Data
+            ms2_gpu = gpu_df[gpu_df['ms_level'] == 2]
+            ms2_gpu = ms2_gpu[['Peptide', 'Charge', 'Run', 'rt', 'mz', 'precursor_mz', 'int']]
+            ms2_gpu = ms2_gpu.rename(columns={'rt': 'RetentionTime',
+                                            'mz': 'Fragment_mz',
+                                            'precursor_mz': 'Precursor_mz',
+                                            'int': 'Intensity'})
+            ms2_df = ms2_gpu.to_pandas()
+        else:
+            # CPU processing with pandas
+            ms1_df = df[(df['ms_level'] == 1) & (df['Annotation'] == 'prec')]
+            ms1_df = ms1_df[['Peptide', 'Charge', 'Run', 'rt', 'precursor_mz', 'int']]
+            ms1_df = ms1_df.rename(columns={'rt': 'RetentionTime',
+                                        'precursor_mz': 'Precursor_mz',
+                                        'int': 'Intensity'})
+            
+            ms2_df = df[df['ms_level'] == 2]
+            ms2_df = ms2_df[['Peptide', 'Charge', 'Run', 'rt', 'mz', 'precursor_mz', 'int']]
+            ms2_df = ms2_df.rename(columns={'rt': 'RetentionTime',
+                                        'mz': 'Fragment_mz',
+                                        'precursor_mz': 'Precursor_mz',
+                                        'int': 'Intensity'})
+        
+        return ms1_df, ms2_df
+
     def run_batch_processing(self):
         """
-        Process peptides in batches to extract MS1 and MS2 features using GPU acceleration.
+        Process precursors in batches to extract MS1 and MS2 features using GPU acceleration.
 
         Steps:
-            1. Load unique peptide-charge pairs from the report.
-            2. Split the peptides into batches based on the configured batch size.
+            1. Load unique precursors-charge pairs from the report.
+            2. Split the precursors into batches based on the configured batch size.
             3. For each peptide, extract features via the MassDASH loader.
             4. Convert the feature data to a GPU DataFrame (cuDF) for accelerated filtering.
             5. Extract and rename MS1 (precursor) and MS2 (fragment) features.
@@ -199,18 +281,18 @@ class DIAtoMassProcessor:
         logging.info(f"Loading peptides from {self.report_path}")
         report_df = pd.read_parquet(self.report_path)
         unique_peptides = report_df[['Modified.Sequence', 'Precursor.Charge']].drop_duplicates()
-        logging.info(f"Total unique peptides: {len(unique_peptides)}")
+        logging.info(f"Total unique precursors: {len(unique_peptides)}")
         
-        # Split unique peptides into batches.
+        # Split unique precursors into batches.
         peptide_batches = np.array_split(unique_peptides, int(np.ceil(len(unique_peptides) / self.batch_size)))
-        logging.info(f"Split peptides into {len(peptide_batches)} batches with batch size {self.batch_size}")
+        logging.info(f"Split precursors into {len(peptide_batches)} batches with batch size {self.batch_size}")
         
         ms1_all_batches = []
         ms2_all_batches = []
         
         # Process each batch sequentially
         for batch_idx, batch in enumerate(peptide_batches):
-            logging.info(f"\nProcessing batch {batch_idx+1}/{len(peptide_batches)} with {len(batch)} peptides")
+            logging.info(f"\nProcessing batch {batch_idx+1}/{len(peptide_batches)} with {len(batch)} precursors")
             batch_start_time = time.time()
             ms1_list = []
             ms2_list = []
@@ -229,33 +311,22 @@ class DIAtoMassProcessor:
                     logging.error(f"    Error loading {peptide} (charge {charge}): {e}")
                     continue
                 
-                # Process each run's feature map
-                for run_name, feature_map in feature_map_collection.items():
-                    # Copy feature DataFrame and add identifying columns
-                    df = feature_map.feature_df.copy()
-                    df['Peptide'] = peptide
-                    df['Charge'] = charge
-                    df['Run'] = run_name
+                # Process all runs in parallel for this peptide/charge combination
+                try:
+                    # Use joblib to parallelize run processing
+                    results = Parallel(n_jobs=self.threads)(
+                        delayed(self.process_run)(run_name, feature_map, peptide, charge)
+                        for run_name, feature_map in feature_map_collection.items()
+                    )
                     
-                    # Convert to cuDF DataFrame for GPU processing
-                    gpu_df = cudf.DataFrame.from_pandas(df)
+                    # Collect parallel processing results
+                    for ms1_df, ms2_df in results:
+                        ms1_list.append(ms1_df)
+                        ms2_list.append(ms2_df)
                     
-                    # ----- Extract MS1 (Precursor) Data -----
-                    ms1_gpu = gpu_df[(gpu_df['ms_level'] == 1) & (gpu_df['Annotation'] == 'prec')]
-                    ms1_gpu = ms1_gpu[['Peptide', 'Charge', 'Run', 'rt', 'precursor_mz', 'int']]
-                    ms1_gpu = ms1_gpu.rename(columns={'rt': 'RetentionTime',
-                                                      'precursor_mz': 'Precursor_mz',
-                                                      'int': 'Intensity'})
-                    ms1_list.append(ms1_gpu.to_pandas())
-                    
-                    # ----- Extract MS2 (Fragment) Data -----
-                    ms2_gpu = gpu_df[gpu_df['ms_level'] == 2]
-                    ms2_gpu = ms2_gpu[['Peptide', 'Charge', 'Run', 'rt', 'mz', 'precursor_mz', 'int']]
-                    ms2_gpu = ms2_gpu.rename(columns={'rt': 'RetentionTime',
-                                                      'mz': 'Fragment_mz',
-                                                      'precursor_mz': 'Precursor_mz',
-                                                      'int': 'Intensity'})
-                    ms2_list.append(ms2_gpu.to_pandas())
+                    logging.info(f"  Processed {len(results)} runs in parallel")
+                except Exception as e:
+                    logging.error(f"  Error in parallel processing: {e}")
             
             # Save current batch results as CSV files
             if ms1_list:
@@ -273,17 +344,27 @@ class DIAtoMassProcessor:
             logging.info(f"Finished processing batch {batch_idx+1} in {batch_elapsed:.2f} seconds.")
         
         # Combine all batch results and export final combined files.
+        
+        # First check if both lists are empty (complete extraction failure)
+        if not ms1_all_batches and not ms2_all_batches:
+            logging.error("No data was extracted. This likely indicates an issue with the extraction process or that none of the peptides from the DIA-NN report were found with MassDash's extraction.")
+            raise ValueError("Feature extraction failed: No MS1 or MS2 features were extracted")
+        
+        # Then handle individual empty list cases
         if ms1_all_batches:
             final_ms1_df = pd.concat(ms1_all_batches, ignore_index=True)
             final_ms1_file = os.path.join(self.ms1_dir, "ms1_features_all_peptides_combined.csv")
             final_ms1_df.to_csv(final_ms1_file, index=False)
         else:
+            logging.warning("No MS1 features were extracted.")
             final_ms1_file = None
+            
         if ms2_all_batches:
             final_ms2_df = pd.concat(ms2_all_batches, ignore_index=True)
             final_ms2_file = os.path.join(self.ms2_dir, "ms2_features_all_peptides_combined.csv")
             final_ms2_df.to_csv(final_ms2_file, index=False)
         else:
+            logging.warning("No MS2 features were extracted.")
             final_ms2_file = None
         
         logging.info("All batches processed and combined.")
@@ -337,14 +418,38 @@ def load_config(config_path):
         logging.error(f"Error reading config file {config_path}: {e}")
         exit(1)
 
-def main():
+def run_feature_extraction(config_path):
     """
-    Main entry point for the feature extraction script.
+    Run the feature extraction pipeline using the specified configuration file.
+    
+    Args:
+        config_path (str): Path to the feature extraction configuration file.
+        
+    Returns:
+        dict: Summary of processing results.
+    """
+    config = load_config(config_path)
+    
+    input_config = config.get("input", {})
+    processing_config = config.get("processing", {})
+    output_config = config.get("output", {})
+    
+    processor = DIAtoMassProcessor(
+        report_path=input_config.get("report_path", "report.parquet"),
+        gen_lib_path=input_config.get("gen_lib_path", "gen_spec_lib.parquet"),
+        mzml_path=input_config.get("mzml_path", "/path/to/mzML/files/*.mzML"),
+        batch_size=processing_config.get("batch_size", 2000),
+        threads=processing_config.get("threads", 4),
+        output_dir=output_config.get("output_dir", "output_features"),
+        rt_window=processing_config.get("rt_window", 50),
+        mz_tol=processing_config.get("mz_tol", 20)
+    )
+    
+    return processor.run_pipeline()
 
-    Parses command-line arguments, loads the configuration,
-    maps configuration settings to processor parameters,
-    and runs the complete feature extraction pipeline.
-    """
+
+def main():
+    """Main entry point for the command-line script."""
     parser = argparse.ArgumentParser(
         description="DIA-NN to MassDASH Feature Extractor",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -352,46 +457,18 @@ def main():
     parser.add_argument(
         '--config',
         type=str,
-        default="dquartic_train_config.json",
-        help="Path to the JSON configuration file."
+        default="feature_extraction_config.json",  # Changed default name
+        help="Path to the feature extraction configuration file."
     )
     args = parser.parse_args()
     
-    config = load_config(args.config)
-    data_config = config.get("data", {})
-    threads = config.get("threads", 4)
+    summary = run_feature_extraction(args.config)
     
-    # Map JSON configuration keys to processor parameters.
-    report_path = data_config.get("ms1_data_path", "report.parquet")
-    gen_lib_path = data_config.get("ms2_data_path", "gen_spec_lib.parquet")
-    mzml_path = data_config.get("raw_files", "/path/to/mzML/files/*.mzML")
-    
-    processor = DIAtoMassProcessor(
-        report_path=report_path,
-        gen_lib_path=gen_lib_path,
-        mzml_path=mzml_path,
-        batch_size=2000,
-        threads=threads,
-        output_dir="output_features",
-        rt_window=50,
-        mz_tol=20
-    )
-    
-    summary = processor.run_pipeline()
-    
-    # Print summary information and integration details
+    # Print summary information
     print("\nProcessing Summary:")
     print(f"Total peptides processed: {summary['total_peptides']}")
     print(f"MS1 features combined file: {summary['ms1_features_combined']}")
     print(f"MS2 features combined file: {summary['ms2_features_combined']}")
-    
-    print("\nIntegration with diffusion-deconvolution-dia-msms-data:")
-    print("Add the following to your dquartic_train_config.json:")
-    print('{\n  "data": {\n'
-          f'    "ms1_data_path": "{summary["ms1_features_combined"]}",\n'
-          f'    "ms2_data_path": "{summary["ms2_features_combined"]}",\n'
-          '    "normalize": "minmax"\n'
-          '  }\n}')
 
 if __name__ == "__main__":
     main()
